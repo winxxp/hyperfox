@@ -19,17 +19,42 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-package main
+// Package logger provides standard logger.
+package logger
 
 import (
-	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/malfunkt/hyperfox/lib/proxy"
 )
 
-// Error values.
-var (
-	ErrMissingSSLCert     = errors.New(`Missing root SSL certificate`)
-	ErrMissingSSLKey      = errors.New(`Missing root SSL key`)
-	ErrBindFailed         = errors.New(`Failed to bind on the given interface: %q`)
-	ErrDatabaseConnection = errors.New(`Database connection error: %q`)
-	ErrDatabaseError      = errors.New(`Database error: %q`)
-)
+func chunk(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+// Stdout struct implements proxy.Logger
+type Stdout struct {
+}
+
+// Log prints a standard log string to the system.
+func (s Stdout) Log(pr *proxy.ProxiedRequest) error {
+
+	line := []string{
+		chunk(pr.Request.RemoteAddr),
+		chunk(""),
+		chunk(""),
+		chunk("[" + time.Now().Format("02/Jan/2006:15:04:05 -0700") + "]"),
+		chunk("\"" + fmt.Sprintf("%s %s %s", pr.Request.Method, pr.Request.URL, pr.Request.Proto) + "\""),
+		chunk(fmt.Sprintf("%d", pr.Response.StatusCode)),
+		chunk(fmt.Sprintf("%d", pr.Response.ContentLength)),
+	}
+
+	fmt.Println(strings.Join(line, " "))
+
+	return nil
+}

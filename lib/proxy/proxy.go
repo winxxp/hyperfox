@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2014 José Carlos Nieto, https://menteslibres.net/xiam
+// Copyright (c) 2012-today José Carlos Nieto, https://menteslibres.net/xiam
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -28,10 +28,13 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 
-	"github.com/xiam/hyperfox/util/otf"
+	"github.com/malfunkt/hyperfox/lib/gencert"
+	"github.com/tv42/httpunix"
 )
 
 const (
@@ -85,6 +88,8 @@ type Logger interface {
 type Proxy struct {
 	// Standard HTTP server
 	srv http.Server
+	// RoundTrip to proxied service
+	rt http.RoundTripper
 	// Writer functions.
 	writers []BodyWriteCloser
 	// Director functions.
@@ -105,8 +110,7 @@ type ProxiedRequest struct {
 
 // NewProxy creates and returns a Proxy reference.
 func NewProxy() *Proxy {
-	p := new(Proxy)
-	return p
+	return &Proxy{}
 }
 
 // Reset clears the list of interfaces.
@@ -118,20 +122,17 @@ func (p *Proxy) Reset() {
 }
 
 // NewProxiedRequest creates and returns a ProxiedRequest reference.
-func (p *Proxy) newProxiedRequest(wri http.ResponseWriter, req *http.Request) *ProxiedRequest {
-
-	pr := &ProxiedRequest{
-		ResponseWriter: wri,
-		Request:        req,
+func (p *Proxy) newProxiedRequest(w http.ResponseWriter, r *http.Request) *ProxiedRequest {
+	return &ProxiedRequest{
+		ResponseWriter: w,
+		Request:        r,
 	}
-
-	return pr
 }
 
 // AddBodyWriteCloser appends a struct that satisfies the BodyWriteCloser
 // interface to the list of body write closers.
-func (p *Proxy) AddBodyWriteCloser(wri BodyWriteCloser) {
-	p.writers = append(p.writers, wri)
+func (p *Proxy) AddBodyWriteCloser(wc BodyWriteCloser) {
+	p.writers = append(p.writers, wc)
 }
 
 // AddDirector appends a struct that satisfies the Director interface to the
@@ -169,25 +170,16 @@ func copyHeader(dst http.Header, src http.Header) {
 // then waits for the server's answer and sends it back to the client.
 //
 // (this method should not be called directly).
-func (p *Proxy) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
-
-	var err error
-	var transport *http.Transport
-
-	pr := p.newProxiedRequest(wri, req)
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	pr := p.newProxiedRequest(w, r)
 
 	out := new(http.Request)
-	*out = *req
+	// Copy request.
+	*out = *r
 
-	if req.TLS == nil {
-		transport = &http.Transport{}
+	if r.TLS == nil {
 		out.URL.Scheme = "http"
 	} else {
-		transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: false,
-			},
-		}
 		out.URL.Scheme = "https"
 	}
 
@@ -210,23 +202,31 @@ func (p *Proxy) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// Intercepting request body.
 	body := bytes.NewBuffer(nil)
 	bodyCopy := bytes.NewBuffer(nil)
-	io.Copy(io.MultiWriter(body, bodyCopy), out.Body)
 
-	out.Body = ioutil.NopCloser(body)
+	if out.Body != nil {
+		io.Copy(io.MultiWriter(body, bodyCopy), out.Body)
+		out.Body.Close()
+		out.Body = ioutil.NopCloser(body)
+	}
 
 	// Proxying client request to destination server.
-	if pr.Response, err = transport.RoundTrip(out); err != nil {
+	var err error
+	if pr.Response, err = p.rt.RoundTrip(out); err != nil {
 		log.Printf("RoundTrip: %q", err)
-		wri.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	defer pr.Response.Body.Close()
 
 	// (Response received).
 
 	// Resetting body (so it can be read later)
-	out.Body = ioutil.NopCloser(bodyCopy)
+	if out.Body != nil {
+		out.Body = ioutil.NopCloser(bodyCopy)
+	}
 
-	// Walking over interceptos.
+	// Walking over interceptors.
 	for i := range p.interceptors {
 		if err := p.interceptors[i].Intercept(pr.Response); err != nil {
 			log.Printf("Interceptor: %q", err)
@@ -251,8 +251,6 @@ func (p *Proxy) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		}
 		ws = append(ws, w)
 	}
-
-	defer pr.Response.Body.Close()
 
 	// Writing response.
 	writers := make([]io.Writer, 0, len(ws)+1)
@@ -283,31 +281,26 @@ func (p *Proxy) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 // Start creates an HTTP proxy server that listens on the given address.
 func (p *Proxy) Start(addr string) error {
-
 	p.srv = http.Server{
 		Addr:    addr,
 		Handler: p,
 	}
+	p.rt = &http.Transport{}
 
 	log.Printf("Listening for incoming HTTP client requests on %s.\n", addr)
-
 	if err := p.srv.ListenAndServe(); err != nil {
 		return err
 	}
-
 	return nil
 }
 
 func certificateLookup(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-
-	cert, key, err := otf.CreateKeyPair(clientHello.ServerName)
-
+	cert, key, err := gencert.CreateKeyPair(clientHello.ServerName)
 	if err != nil {
 		return nil, err
 	}
 
 	var tlsCert tls.Certificate
-
 	if tlsCert, err = tls.LoadX509KeyPair(cert, key); err != nil {
 		return nil, err
 	}
@@ -317,7 +310,6 @@ func certificateLookup(clientHello *tls.ClientHelloInfo) (*tls.Certificate, erro
 
 // StartTLS creates an HTTPs proxy server that listens on the given address.
 func (p *Proxy) StartTLS(addr string) error {
-
 	p.srv = http.Server{
 		Addr:    addr,
 		Handler: p,
@@ -326,15 +318,51 @@ func (p *Proxy) StartTLS(addr string) error {
 			InsecureSkipVerify: false,
 		},
 	}
+	p.rt = &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: false,
+		},
+	}
 
 	log.Printf("Listening for incoming HTTPs client requests on %s.\n", addr)
 
-	otf.SetRootCACert(os.Getenv(EnvSSLCert))
-	otf.SetRootCAKey(os.Getenv(EnvSSLKey))
+	gencert.SetRootCACert(os.Getenv(EnvSSLCert))
+	gencert.SetRootCAKey(os.Getenv(EnvSSLKey))
 
 	if err := p.srv.ListenAndServeTLS(os.Getenv(EnvSSLCert), os.Getenv(EnvSSLKey)); err != nil {
 		return err
 	}
-
 	return nil
+}
+
+// StartUnix creates an HTTP proxy server that listens on the proxy unix socket and forwards to proxied unix socket.
+func (p *Proxy) StartUnix(proxy string, proxied string) error {
+	p.srv = http.Server{
+		Addr:    "http+unix://proxy",
+		Handler: p,
+	}
+	u := &httpunix.Transport{}
+	u.RegisterLocation("proxied", proxied)
+	p.rt = u
+	p.AddDirector(UnixDirector{"http+unix://proxied"})
+
+	log.Printf("Listening for incoming HTTP client requests on %s\n", proxy)
+
+	os.Remove(proxy)
+	l, err := net.Listen("unix", proxy)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+	defer os.Remove(proxy)
+	return p.srv.Serve(l)
+}
+
+type UnixDirector struct {
+	URL string
+}
+
+func (d UnixDirector) Direct(req *http.Request) (err error) {
+	req.URL, err = url.Parse(d.URL + req.RequestURI)
+	return
 }

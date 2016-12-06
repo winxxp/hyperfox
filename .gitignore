@@ -2,3 +2,5 @@
 *.db
 hyperfox
 certs/
+bin/
+vendor/*/
